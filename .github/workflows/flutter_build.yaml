@@ -35,18 +35,38 @@ jobs:
           unzip -q project.zip -d project
           ls -la project
 
+      - name: Locate project directory
+        id: locate
+        run: |
+          # Cari folder yang berisi pubspec.yaml, tidak peduli seberapa dalam nested-nya.
+          # ZIP dari GitHub Release biasanya punya 1 folder pembungkus di dalamnya
+          # (contoh: project/myapp-main/pubspec.yaml), jadi kita tidak boleh
+          # asumsikan pubspec.yaml selalu ada tepat di project/.
+          PUBSPEC_PATH=$(find project -maxdepth 5 -iname "pubspec.yaml" | head -n 1)
+
+          if [ -z "$PUBSPEC_PATH" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan browser_url mengarah ke ZIP project Flutter yang valid."
+            find project -maxdepth 3
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$PUBSPEC_PATH")
+          echo "Project ditemukan di: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
       - name: Install dependencies
         run: |
-          cd project
+          cd "${{ steps.locate.outputs.project_dir }}"
           flutter pub get
 
       - name: Build APK
         run: |
-          cd project
+          cd "${{ steps.locate.outputs.project_dir }}"
           flutter build apk --${{ inputs.build_type }} --no-tree-shake-icons
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-${{ inputs.build_type }}-${{ inputs.tag }}
-          path: project/build/app/outputs/flutter-apk/*.apk
+          path: ${{ steps.locate.outputs.project_dir }}/build/app/outputs/flutter-apk/*.apk
+          
