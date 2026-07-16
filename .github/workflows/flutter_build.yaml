@@ -1,0 +1,52 @@
+name: Flutter Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (untuk identifikasi)'
+        required: true
+      browser_url:
+        description: 'URL download ZIP project dari release'
+        required: true
+      build_type:
+        description: 'debug atau release'
+        required: false
+        default: 'release'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'   # Ganti sesuai versi Flutter yang kamu pakai
+          channel: 'stable'
+          cache: true
+
+      - name: Download project ZIP
+        run: |
+          curl -L -o project.zip "${{ inputs.browser_url }}"
+          unzip -q project.zip -d project
+          ls -la project
+
+      - name: Install dependencies
+        run: |
+          cd project
+          flutter pub get
+
+      - name: Build APK
+        run: |
+          cd project
+          flutter build apk --${{ inputs.build_type }} --no-tree-shake-icons
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ inputs.build_type }}-${{ inputs.tag }}
+          path: project/build/app/outputs/flutter-apk/*.apk
