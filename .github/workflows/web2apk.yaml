@@ -1,0 +1,48 @@
+name: Web to APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL website target'
+        required: true
+      app_name:
+        description: 'Nama aplikasi'
+        required: true
+      icon_url:
+        description: 'URL ikon (format PNG)'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install PWA2APK
+        run: npm install -g pwa2apk
+
+      - name: Download Icon
+        run: curl -L -o icon.png "${{ inputs.icon_url }}"
+
+      - name: Generate APK
+        run: |
+          pwa2apk generate \
+            --name "${{ inputs.app_name }}" \
+            --url "${{ inputs.url }}" \
+            --icon icon.png \
+            --output app.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webapp-${{ inputs.app_name }}
+          path: app.apk
