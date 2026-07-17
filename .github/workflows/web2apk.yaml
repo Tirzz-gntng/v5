@@ -10,7 +10,7 @@ on:
         description: 'Nama aplikasi'
         required: true
       icon_url:
-        description: 'URL ikon (format PNG)'
+        description: 'URL ikon (format PNG, disarankan persegi min 512x512)'
         required: true
 
 jobs:
@@ -25,24 +25,82 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: Install PWA2APK
-        run: npm install -g pwa2apk
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
 
-      - name: Download Icon
-        run: curl -L -o icon.png "${{ inputs.icon_url }}"
-
-      - name: Generate APK
+      - name: Sanitize app name & package id
+        id: meta
         run: |
-          pwa2apk generate \
-            --name "${{ inputs.app_name }}" \
-            --url "${{ inputs.url }}" \
-            --icon icon.png \
-            --output app.apk
+          RAW_NAME="${{ inputs.app_name }}"
+          SAFE_NAME=$(echo "$RAW_NAME" | tr -cd '[:alnum:] ' | xargs)
+          if [ -z "$SAFE_NAME" ]; then SAFE_NAME="WebApp"; fi
+          PKG_SUFFIX=$(echo "$RAW_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
+          if [ -z "$PKG_SUFFIX" ]; then PKG_SUFFIX="app"; fi
+          PKG_ID="com.tirzzbuild.${PKG_SUFFIX}${GITHUB_RUN_ID}"
+          echo "safe_name=$SAFE_NAME" >> "$GITHUB_OUTPUT"
+          echo "pkg_id=$PKG_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Scaffold Capacitor project
+        run: |
+          set -e
+          mkdir -p webapp/www
+          echo "<html><body>Loading...</body></html>" > webapp/www/index.html
+          cd webapp
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          npx cap init "${{ steps.meta.outputs.safe_name }}" "${{ steps.meta.outputs.pkg_id }}" --web-dir=www
+
+      - name: Point app to remote URL
+        run: |
+          cd webapp
+          cat > capacitor.config.json <<EOF
+          {
+            "appId": "${{ steps.meta.outputs.pkg_id }}",
+            "appName": "${{ steps.meta.outputs.safe_name }}",
+            "webDir": "www",
+            "server": {
+              "url": "${{ inputs.url }}",
+              "cleartext": true
+            }
+          }
+          EOF
+
+      - name: Add Android platform
+        run: |
+          cd webapp
+          npx cap add android
+          npx cap sync android
+
+      - name: Download & install icon
+        run: |
+          set -e
+          cd webapp
+          curl -L -f -o icon.png "${{ inputs.icon_url }}"
+          sudo apt-get update -y && sudo apt-get install -y imagemagick
+
+          declare -A SIZES=( [mdpi]=48 [hdpi]=72 [xhdpi]=96 [xxhdpi]=144 [xxxhdpi]=192 )
+          for density in "${!SIZES[@]}"; do
+            size=${SIZES[$density]}
+            dir="android/app/src/main/res/mipmap-${density}"
+            mkdir -p "$dir"
+            convert icon.png -resize ${size}x${size} "$dir/ic_launcher.png"
+            convert icon.png -resize ${size}x${size} "$dir/ic_launcher_round.png"
+          done
+
+      - name: Build debug APK
+        run: |
+          cd webapp/android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: webapp-${{ inputs.app_name }}
-          path: app.apk
+          name: webapp-${{ steps.meta.outputs.safe_name }}
+          path: webapp/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          
