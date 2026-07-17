@@ -13,6 +13,10 @@ on:
         description: 'debug atau release'
         required: false
         default: 'release'
+      flutter_version:
+        description: 'Versi Flutter spesifik (opsional, kosongkan untuk pakai stable terbaru). Contoh: 3.32.0'
+        required: false
+        default: ''
 
 jobs:
   build:
@@ -31,7 +35,8 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: 'stable'          # selalu ambil Flutter stable terbaru → Dart SDK ikut terbaru
+          flutter-version: ${{ inputs.flutter_version }}   # kosong = pakai channel stable terbaru
+          channel: 'stable'
           cache: true
 
       - name: Download & extract project ZIP
