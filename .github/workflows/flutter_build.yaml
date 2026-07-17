@@ -31,8 +31,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'   # Ganti sesuai versi Flutter project kamu
-          channel: 'stable'
+          channel: 'stable'          # selalu ambil Flutter stable terbaru → Dart SDK ikut terbaru
           cache: true
 
       - name: Download & extract project ZIP
