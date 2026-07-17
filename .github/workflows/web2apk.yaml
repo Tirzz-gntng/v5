@@ -1,106 +1,259 @@
-name: Web to APK
+name: Web to APK Build
 
-on:
+# Ditrigger oleh bot Telegram (Tirzz Build Bot) lewat workflow_dispatch.
+# Input dikirim oleh server.js -> triggerWeb2ApkWorkflow().
+"on":
   workflow_dispatch:
     inputs:
-      url:
-        description: 'URL website target'
+      web_url:
+        description: "URL website yang mau dibungkus jadi APK (WebView)"
         required: true
+        type: string
       app_name:
-        description: 'Nama aplikasi'
+        description: "Nama aplikasi (ditampilkan di home screen)"
         required: true
+        type: string
       icon_url:
-        description: 'URL ikon (format PNG, disarankan persegi min 512x512)'
+        description: "URL icon PNG (opsional)"
+        required: false
+        default: ""
+        type: string
+      tag:
+        description: "Tag unik build"
         required: true
+        type: string
+
+# PENTING: input di atas berasal langsung dari user Telegram, jadi TIDAK BOLEH
+# diinterpolasi pakai ${{ github.event.inputs.x }} di dalam "run:" (celah shell
+# injection). Semua dipindah ke `env:` lebih dulu dan dipakai lewat variabel
+# shell ($WEB_URL, dst), dan untuk isi source Dart dipakai --dart-define
+# (bukan ditulis manual ke file .dart) supaya nilainya tidak pernah jadi kode.
+env:
+  WEB_URL: ${{ github.event.inputs.web_url }}
+  APP_NAME: ${{ github.event.inputs.app_name }}
+  ICON_URL: ${{ github.event.inputs.icon_url }}
+  BUILD_TAG: ${{ github.event.inputs.tag }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web2apk-build-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+      - name: Validasi input
+        run: |
+          set -euo pipefail
+          if [ -z "${WEB_URL:-}" ]; then
+            echo "::error::Input web_url kosong."
+            exit 1
+          fi
+          case "$WEB_URL" in
+            http://*|https://*) ;;
+            *) echo "::error::web_url harus diawali http:// atau https://"; exit 1 ;;
+          esac
+          if [ -z "${APP_NAME:-}" ]; then
+            echo "::error::Input app_name kosong."
+            exit 1
+          fi
+          if [ -z "${BUILD_TAG:-}" ]; then
+            echo "::error::Input tag kosong."
+            exit 1
+          fi
 
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          distribution: "temurin"
+          java-version: "17"
 
-      - name: Sanitize app name & package id
-        id: meta
-        run: |
-          RAW_NAME="${{ inputs.app_name }}"
-          SAFE_NAME=$(echo "$RAW_NAME" | tr -cd '[:alnum:] ' | xargs)
-          if [ -z "$SAFE_NAME" ]; then SAFE_NAME="WebApp"; fi
-          PKG_SUFFIX=$(echo "$RAW_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
-          if [ -z "$PKG_SUFFIX" ]; then PKG_SUFFIX="app"; fi
-          PKG_ID="com.tirzzbuild.${PKG_SUFFIX}${GITHUB_RUN_ID}"
-          echo "safe_name=$SAFE_NAME" >> "$GITHUB_OUTPUT"
-          echo "pkg_id=$PKG_ID" >> "$GITHUB_OUTPUT"
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          cache: true
 
-      - name: Scaffold Capacitor project
-        run: |
-          set -e
-          mkdir -p webapp/www
-          echo "<html><body>Loading...</body></html>" > webapp/www/index.html
-          cd webapp
-          npm init -y
-          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
-          npx cap init "${{ steps.meta.outputs.safe_name }}" "${{ steps.meta.outputs.pkg_id }}" --web-dir=www
+      - name: Buat project Flutter WebView
+        run: flutter create --org com.tirzz.web2apk --project-name web2apk_app webapp
 
-      - name: Point app to remote URL
+      - name: Tambah dependency webview_flutter
+        working-directory: webapp
+        run: flutter pub add webview_flutter
+
+      # File ini STATIS (heredoc pakai 'EOF' berkutip supaya tidak ada variabel
+      # shell yang di-expand ke dalamnya). URL & nama app di-inject aman lewat
+      # --dart-define saat build, bukan ditulis langsung ke source.
+      - name: Tulis lib/main.dart (template statis)
+        working-directory: webapp
         run: |
-          cd webapp
-          cat > capacitor.config.json <<EOF
-          {
-            "appId": "${{ steps.meta.outputs.pkg_id }}",
-            "appName": "${{ steps.meta.outputs.safe_name }}",
-            "webDir": "www",
-            "server": {
-              "url": "${{ inputs.url }}",
-              "cleartext": true
+          cat > lib/main.dart << 'EOF'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          const String kWebUrl = String.fromEnvironment('WEB_URL', defaultValue: 'https://example.com');
+          const String kAppName = String.fromEnvironment('APP_NAME', defaultValue: 'WebView App');
+
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: kAppName,
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
+                home: const WebViewScreen(),
+              );
+            }
+          }
+
+          class WebViewScreen extends StatefulWidget {
+            const WebViewScreen({super.key});
+
+            @override
+            State<WebViewScreen> createState() => _WebViewScreenState();
+          }
+
+          class _WebViewScreenState extends State<WebViewScreen> {
+            late final WebViewController _controller;
+            bool _loading = true;
+
+            @override
+            void initState() {
+              super.initState();
+              _controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onPageStarted: (_) => setState(() => _loading = true),
+                    onPageFinished: (_) => setState(() => _loading = false),
+                  ),
+                )
+                ..loadRequest(Uri.parse(kWebUrl));
+            }
+
+            Future<bool> _onWillPop() async {
+              if (await _controller.canGoBack()) {
+                await _controller.goBack();
+                return false;
+              }
+              return true;
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return PopScope(
+                canPop: false,
+                onPopInvoked: (didPop) async {
+                  if (didPop) return;
+                  if (await _onWillPop()) {
+                    if (context.mounted) Navigator.of(context).maybePop();
+                  }
+                },
+                child: Scaffold(
+                  body: SafeArea(
+                    child: Stack(
+                      children: [
+                        WebViewWidget(controller: _controller),
+                        if (_loading) const Center(child: CircularProgressIndicator()),
+                      ],
+                    ),
+                  ),
+                ),
+              );
             }
           }
           EOF
 
-      - name: Add Android platform
+      - name: Set nama aplikasi di AndroidManifest.xml
+        working-directory: webapp
         run: |
-          cd webapp
-          npx cap add android
-          npx cap sync android
+          python3 - << 'PYEOF'
+          import os
+          from xml.sax.saxutils import escape
 
-      - name: Download & install icon
+          app_name = escape(os.environ["APP_NAME"])
+          manifest_path = "android/app/src/main/AndroidManifest.xml"
+
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          import re
+          new_content, count = re.subn(
+              r'android:label="[^"]*"',
+              f'android:label="{app_name}"',
+              content,
+              count=1,
+          )
+          if count == 0:
+              raise SystemExit("android:label tidak ditemukan di AndroidManifest.xml")
+
+          with open(manifest_path, "w", encoding="utf-8") as f:
+              f.write(new_content)
+
+          print(f"AndroidManifest.xml label diset ke: {app_name}")
+          PYEOF
+
+      - name: Download & pasang icon (opsional)
+        if: ${{ github.event.inputs.icon_url != '' }}
+        working-directory: webapp
         run: |
-          set -e
-          cd webapp
-          curl -L -f -o icon.png "${{ inputs.icon_url }}"
-          sudo apt-get update -y && sudo apt-get install -y imagemagick
+          set -euo pipefail
+          mkdir -p assets/icon
+          curl -fL --retry 3 --retry-delay 5 -o assets/icon/icon.png "$ICON_URL"
 
-          declare -A SIZES=( [mdpi]=48 [hdpi]=72 [xhdpi]=96 [xxhdpi]=144 [xxxhdpi]=192 )
-          for density in "${!SIZES[@]}"; do
-            size=${SIZES[$density]}
-            dir="android/app/src/main/res/mipmap-${density}"
-            mkdir -p "$dir"
-            convert icon.png -resize ${size}x${size} "$dir/ic_launcher.png"
-            convert icon.png -resize ${size}x${size} "$dir/ic_launcher_round.png"
-          done
+          cat >> pubspec.yaml << 'EOF'
 
-      - name: Build debug APK
+          flutter_icons:
+            android: true
+            ios: false
+            image_path: "assets/icon/icon.png"
+          EOF
+
+          flutter pub add --dev flutter_launcher_icons
+          dart run flutter_launcher_icons
+
+      - name: flutter pub get
+        working-directory: webapp
+        run: flutter pub get
+
+      - name: Build APK (release)
+        working-directory: webapp
         run: |
-          cd webapp/android
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          set -euo pipefail
+          flutter build apk --release \
+            --dart-define=WEB_URL="$WEB_URL" \
+            --dart-define=APP_NAME="$APP_NAME"
 
-      - name: Upload APK artifact
+      - name: Kumpulkan hasil APK
+        id: apk
+        run: |
+          set -euo pipefail
+          APK_PATH="$(find webapp -type f -name '*.apk' -path '*/outputs/flutter-apk/*' | sort | head -n 1)"
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::Build sukses tapi file .apk tidak ditemukan."
+            exit 1
+          fi
+          mkdir -p apk_output
+          SAFE_TAG="$(echo "$BUILD_TAG" | tr -c 'A-Za-z0-9._-' '_')"
+          DEST="apk_output/web2apk-${SAFE_TAG}.apk"
+          cp "$APK_PATH" "$DEST"
+          echo "path=$DEST" >> "$GITHUB_OUTPUT"
+          echo "name=apk-build-${SAFE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK sebagai artifact
         uses: actions/upload-artifact@v4
         with:
-          name: webapp-${{ steps.meta.outputs.safe_name }}
-          path: webapp/android/app/build/outputs/apk/debug/app-debug.apk
+          # Nama HARUS mengandung kata "apk" atau "build" â€” dibaca oleh bot
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
+          retention-days: 1
           if-no-files-found: error
           
