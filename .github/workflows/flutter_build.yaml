@@ -1,111 +1,111 @@
-name: Flutter Build APK
+name: Build Flutter APK (Fallback Worker)
 
-# Ditrigger oleh bot Telegram (Tirzz Build Bot) lewat workflow_dispatch.
-# Input dikirim oleh server.js -> triggerWorkflow(). Simpan file ini di repo target
-# (GITHUB_OWNER/GITHUB_REPO di .env bot) pada path: .github/workflows/flutter_build.yml
 on:
   workflow_dispatch:
     inputs:
-      zip_url:
-        description: "URL ZIP project Flutter (GitHub Release asset)"
+      jobId:
+        description: 'Job ID from Bot'
         required: true
-        type: string
-      tag:
-        description: "Tag unik build (dipakai untuk nama artifact & release cleanup)"
+      userId:
+        description: 'User ID'
         required: true
-        type: string
-      build_type:
-        description: "Mode build: debug atau release"
-        required: false
-        default: "release"
-        type: string
+      payload:
+        description: 'Build Payload (JSON)'
+        required: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
-      - name: Checkout repo
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Validasi input wajib
-        run: |
-          if [ -z "${{ inputs.zip_url }}" ]; then
-            echo "::error::Input zip_url kosong."
-            exit 1
-          fi
-          if [ -z "${{ inputs.tag }}" ]; then
-            echo "::error::Input tag kosong."
-            exit 1
-          fi
-
-      - name: Setup Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
-          java-version: "17"
+          distribution: 'zulu'
+          java-version: '17'
 
-      # PENTING — JANGAN naikkan versi ini ke >= 3.44 kecuali font_awesome_flutter
-      # di project kamu sudah di-upgrade ke v11+. Flutter 3.44 menjadikan class
-      # IconData "final" (tidak bisa di-extend), yang membuat font_awesome_flutter
-      # versi lama (mis. 10.12.0) gagal compile dengan error:
-      #   "The class 'IconData' can't be extended outside of its library
-      #    because it's a final class."
-      # 3.41.x adalah rilis stabil terakhir SEBELUM breaking change tersebut.
-      - name: Setup Flutter SDK (pinned 3.41.x, sebelum breaking change IconData final)
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.41.9"
-          channel: "stable"
-          cache: true
+          flutter-version: '3.38.0'
+          channel: 'stable'
+          # Disamain PERSIS dengan versi yang dipakai installer VPS
+          # (lihat worker/installer.js -> flutter_linux_3.38.0-stable.tar.xz)
+          # biar hasil build di GitHub Actions konsisten sama VPS.
 
-      - name: Download ZIP project
+      - name: Prepare Project
         env:
-          ZIP_URL: ${{ inputs.zip_url }}
-        run: curl -L --fail -o project.zip "$ZIP_URL"
-
-      - name: Extract ZIP
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          rm -rf project
-          mkdir -p project
-          unzip -q project.zip -d project
+          set -e
+          echo '${{ github.event.inputs.payload }}' > payload.json
+          cat payload.json
 
-          # Kalau isi ZIP cuma 1 folder pembungkus di root, naikkan isinya
-          shopt -s nullglob dotglob
-          entries=(project/*/)
-          if [ "${#entries[@]}" -eq 1 ] && [ -f "${entries[0]}pubspec.yaml" ]; then
-            tmp=$(mktemp -d)
-            mv "${entries[0]}"* "$tmp"/
-            rm -rf project
-            mv "$tmp" project
-          fi
+          # Bot bisa kirim salah satu dari 2 field ini tergantung mode upload
+          ASSET_URL=$(jq -r '.zipAssetUrl // .url // empty' payload.json)
 
-      - name: Validasi pubspec.yaml
-        run: |
-          if [ ! -f project/pubspec.yaml ]; then
-            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ZIP berisi project Flutter yang valid (pubspec.yaml di root project)."
+          if [ -z "$ASSET_URL" ]; then
+            echo "::error::Tidak ada zipAssetUrl atau url di payload. Isi payload:"
+            cat payload.json
             exit 1
           fi
 
-      - name: Flutter pub get
-        working-directory: project
-        run: flutter pub get
+          echo "Downloading project source from: $ASSET_URL"
 
-      - name: Build APK
-        working-directory: project
-        run: |
-          if [ "${{ inputs.build_type }}" = "debug" ]; then
-            flutter build apk --debug
+          rm -rf project project.zip
+          mkdir -p project
+
+          if [[ "$ASSET_URL" == *"api.github.com"* ]]; then
+            # GitHub Release asset API url -> perlu auth header + Accept octet-stream
+            curl -fL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -o project.zip \
+              "$ASSET_URL"
           else
-            flutter build apk --release
+            # Public URL biasa
+            curl -fL -o project.zip "$ASSET_URL"
           fi
 
-      - name: Upload APK sebagai artifact
-        if: always()
+          unzip -q project.zip -d project
+
+          # Beberapa ZIP punya folder pembungkus tambahan (mis: project/myapp/pubspec.yaml)
+          # Auto-detect lokasi pubspec.yaml biar gak salah cd
+          PUBSPEC=$(find project -maxdepth 5 -type f -name pubspec.yaml | head -n 1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ini project Flutter yang valid."
+            find project -maxdepth 3
+            exit 1
+          fi
+
+          PROJECT_ROOT=$(dirname "$PUBSPEC")
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "Detected Flutter project root: $PROJECT_ROOT"
+
+      - name: Build APK
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+          flutter clean
+          flutter pub get
+          flutter build apk --release
+
+      - name: Locate APK
+        run: |
+          set -e
+          APK_PATH=$(find "$PROJECT_ROOT" -type f -name "app-release.apk" -path "*/flutter-apk/*" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::app-release.apk tidak ditemukan setelah build."
+            find "$PROJECT_ROOT/build" -maxdepth 5 2>/dev/null || true
+            exit 1
+          fi
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          echo "Found APK at: $APK_PATH"
+
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ inputs.tag }}
-          path: project/build/app/outputs/flutter-apk/*.apk
-          if-no-files-found: warn
-          retention-days: 1
-          
+          name: apk-${{ github.event.inputs.jobId }}
+          path: ${{ env.APK_PATH }}
