@@ -3,6 +3,9 @@ name: Web2APK
 on:
   workflow_dispatch:
     inputs:
+      tag:
+        description: 'Unique run tag from bot'
+        required: true
       web_url:
         description: 'URL Website'
         required: true
@@ -12,6 +15,8 @@ on:
       icon_url:
         description: 'Icon Url'
         required: true
+
+run-name: ${{ inputs.tag }}
 
 jobs:
   build:
@@ -446,11 +451,33 @@ jobs:
           mkdir -p myapp/assets/icon
           sudo apt-get install -y imagemagick
 
-          curl -L \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/octet-stream" \
-            "${{ github.event.inputs.icon_url }}" \
-            -o myapp/assets/icon/icon_raw
+          ICON_URL="${{ github.event.inputs.icon_url }}"
+          echo "Downloading icon from: $ICON_URL"
+
+          # Coba download dengan header GitHub dulu (kalau URL asset GitHub)
+          # Kalau gagal / bukan GitHub, fallback ke curl biasa (untuk URL publik)
+          if [[ "$ICON_URL" == *"github"* ]] || [[ "$ICON_URL" == *"githubusercontent"* ]]; then
+            curl -L --fail --retry 3 \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/octet-stream" \
+              "$ICON_URL" \
+              -o myapp/assets/icon/icon_raw || \
+            curl -L --fail --retry 3 \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "$ICON_URL" \
+              -o myapp/assets/icon/icon_raw
+          else
+            curl -L --fail --retry 3 \
+              -A "Mozilla/5.0" \
+              "$ICON_URL" \
+              -o myapp/assets/icon/icon_raw
+          fi
+
+          # Validasi file tidak kosong
+          if [ ! -s myapp/assets/icon/icon_raw ]; then
+            echo "::error::Icon download gagal / file kosong"
+            exit 1
+          fi
 
           # Mengubah gambar menjadi format PNG 1024x1024 yang valid
           convert myapp/assets/icon/icon_raw \
@@ -458,7 +485,13 @@ jobs:
             -gravity center \
             -resize 1024x1024 \
             -extent 1024x1024 \
-            myapp/assets/icon/icon.png
+            myapp/assets/icon/icon.png || {
+              echo "::error::Gagal convert icon. File mungkin bukan gambar valid."
+              file myapp/assets/icon/icon_raw || true
+              exit 1
+            }
+
+          ls -la myapp/assets/icon/
 
       - name: Write launcher icons config
         run: |
