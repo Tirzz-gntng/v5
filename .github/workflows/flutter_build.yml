@@ -1,77 +1,111 @@
-name: Build Flutter APK
+name: Build Flutter APK (Fallback Worker)
 
 on:
   workflow_dispatch:
     inputs:
-      build_id:
-        description: "Build ID"
+      jobId:
+        description: 'Job ID from Bot'
         required: true
-      build_type:
-        description: "release atau debug"
-        required: false
-        default: "release"
-
-run-name: flutter-build-${{ inputs.build_id }}
+      userId:
+        description: 'User ID'
+        required: true
+      payload:
+        description: 'Build Payload (JSON)'
+        required: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'zulu'
           java-version: '17'
 
-      - name: Set up Flutter
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: '3.38.0'
+          channel: 'stable'
+          # Disamain PERSIS dengan versi yang dipakai installer VPS
+          # (lihat worker/installer.js -> flutter_linux_3.38.0-stable.tar.xz)
+          # biar hasil build di GitHub Actions konsisten sama VPS.
 
-      - name: Unzip project
+      - name: Prepare Project
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p project
-          unzip -q "builds/${{ inputs.build_id }}.zip" -d project
-          # Kalau hasil unzip punya 1 folder pembungkus, masuk ke dalamnya
-          if [ "$(ls -1 project | wc -l)" = "1" ] && [ -d "project/$(ls -1 project)" ]; then
-            mv "project/$(ls -1 project)"/* project/ 2>/dev/null || true
+          set -e
+          echo '${{ github.event.inputs.payload }}' > payload.json
+          cat payload.json
+
+          # Bot bisa kirim salah satu dari 2 field ini tergantung mode upload
+          ASSET_URL=$(jq -r '.zipAssetUrl // .url // empty' payload.json)
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "::error::Tidak ada zipAssetUrl atau url di payload. Isi payload:"
+            cat payload.json
+            exit 1
           fi
 
-      - name: Flutter pub get
-        working-directory: project
-        run: flutter pub get
+          echo "Downloading project source from: $ASSET_URL"
+
+          rm -rf project project.zip
+          mkdir -p project
+
+          if [[ "$ASSET_URL" == *"api.github.com"* ]]; then
+            # GitHub Release asset API url -> perlu auth header + Accept octet-stream
+            curl -fL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -o project.zip \
+              "$ASSET_URL"
+          else
+            # Public URL biasa
+            curl -fL -o project.zip "$ASSET_URL"
+          fi
+
+          unzip -q project.zip -d project
+
+          # Beberapa ZIP punya folder pembungkus tambahan (mis: project/myapp/pubspec.yaml)
+          # Auto-detect lokasi pubspec.yaml biar gak salah cd
+          PUBSPEC=$(find project -maxdepth 5 -type f -name pubspec.yaml | head -n 1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ini project Flutter yang valid."
+            find project -maxdepth 3
+            exit 1
+          fi
+
+          PROJECT_ROOT=$(dirname "$PUBSPEC")
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "Detected Flutter project root: $PROJECT_ROOT"
 
       - name: Build APK
-        working-directory: project
         run: |
-          if [ "${{ inputs.build_type }}" = "debug" ]; then
-            flutter build apk --debug
-          else
-            flutter build apk --release --no-tree-shake-icons
-          fi
+          set -e
+          cd "$PROJECT_ROOT"
+          flutter clean
+          flutter pub get
+          flutter build apk --release
 
       - name: Locate APK
-        id: apk
         run: |
-          APK_PATH=$(find project/build/app/outputs/flutter-apk -name "*.apk" | head -n 1)
-          echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
+          set -e
+          APK_PATH=$(find "$PROJECT_ROOT" -type f -name "app-release.apk" -path "*/flutter-apk/*" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::app-release.apk tidak ditemukan setelah build."
+            find "$PROJECT_ROOT/build" -maxdepth 5 2>/dev/null || true
+            exit 1
+          fi
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          echo "Found APK at: $APK_PATH"
 
-      - name: Upload APK artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ inputs.build_id }}
-          path: ${{ steps.apk.outputs.path }}
-          retention-days: 1
-
-      - name: Cleanup build zip from repo
-        if: always()
-        run: |
-          git config user.name "web2apk-bot"
-          git config user.email "bot@web2apk.local"
-          git rm -f "builds/${{ inputs.build_id }}.zip" || true
-          git commit -m "chore: cleanup build ${{ inputs.build_id }}" || true
-          git push || true
+          name: apk-${{ github.event.inputs.jobId }}
+          path: ${{ env.APK_PATH }}
