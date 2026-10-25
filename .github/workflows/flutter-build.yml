@@ -1,0 +1,111 @@
+name: Flutter Build APK
+
+# Workflow build APK Flutter dari ZIP project yang di-upload bot
+# ke Release. Dipicu via workflow_dispatch oleh bot (server.js).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag release tempat ZIP project berada"
+        required: true
+        type: string
+      build_type:
+        description: "Tipe build APK"
+        required: true
+        type: choice
+        options:
+          - release
+          - debug
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17 (Zulu)
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      # Versi Flutter stable TERBARU (sesuai kebutuhan: selalu up-to-date)
+      - name: Setup Flutter (stable terbaru)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Download ZIP project dari Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          curl -sL -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ inputs.tag }}" \
+            -o release.json
+          ZIP_URL=$(jq -r '.assets[0].url' release.json)
+          if [ -z "$ZIP_URL" ] || [ "$ZIP_URL" = "null" ]; then
+            echo "::error::Asset ZIP tidak ditemukan pada release ${{ inputs.tag }}"
+            exit 1
+          fi
+          curl -sL -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            "$ZIP_URL" -o project.zip
+          echo "ZIP size: $(du -h project.zip | cut -f1)"
+
+          # Ekstrak + ratakan jika ZIP punya satu folder root
+          rm -rf extracted project
+          mkdir -p extracted project
+          unzip -q project.zip -d extracted
+          DIRS=$(find extracted -mindepth 1 -maxdepth 1 -type d | wc -l)
+          FILES=$(find extracted -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$DIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
+            INNER=$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n1)
+            mv "$INNER"/* ./project/ || true
+            cp -a "$INNER"/.[!.]* ./project/ 2>/dev/null || true
+          else
+            mv extracted/* ./project/ || true
+            cp -a extracted/.[!.]* ./project/ 2>/dev/null || true
+          fi
+          echo "=== Isi folder project ==="
+          ls -la ./project
+
+      - name: Siapkan project Flutter
+        working-directory: ./project
+        run: |
+          set -e
+          flutter config --no-analytics
+          # Jika project tidak punya folder android (mis. hanya lib/ + pubspec.yaml),
+          # generate platform Android otomatis.
+          if [ ! -d "android" ]; then
+            PROJECT_NAME=$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -d ' ' || echo "app")
+            if [ -z "$PROJECT_NAME" ]; then PROJECT_NAME="app"; fi
+            echo "Folder android tidak ada → flutter create --project-name $PROJECT_NAME"
+            flutter create . --platforms android --project-name "$PROJECT_NAME"
+          fi
+          flutter pub get
+
+      - name: Build APK
+        working-directory: ./project
+        run: |
+          set -e
+          chmod +x android/gradlew || true
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+          echo "=== Hasil build ==="
+          ls -la build/app/outputs/flutter-apk/ || true
+
+      - name: Upload artifact APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-apk
+          path: project/build/app/outputs/flutter-apk/*.apk
+          retention-days: 3
+          if-no-files-found: error
