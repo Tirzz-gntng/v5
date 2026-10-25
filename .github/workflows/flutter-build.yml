@@ -44,17 +44,41 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          curl -sL -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ inputs.tag }}" \
-            -o release.json
-          ZIP_URL=$(jq -r '.assets[0].url' release.json)
+          # Release yang baru dibuat bot kadang belum terbaca oleh API —
+          # makanya dicoba ulang beberapa kali sebelum nyerah.
+          ZIP_URL=""
+          for i in 1 2 3 4 5 6; do
+            curl -sL -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ inputs.tag }}" \
+              -o release.json
+            ZIP_URL=$(jq -r '.assets[0].url' release.json)
+            if [ -n "$ZIP_URL" ] && [ "$ZIP_URL" != "null" ]; then
+              break
+            fi
+            echo "Percobaan $i/6: asset release belum terlihat, tunggu 5 detik..."
+            sleep 5
+          done
           if [ -z "$ZIP_URL" ] || [ "$ZIP_URL" = "null" ]; then
             echo "::error::Asset ZIP tidak ditemukan pada release ${{ inputs.tag }}"
             exit 1
           fi
-          curl -sL -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/octet-stream" \
-            "$ZIP_URL" -o project.zip
+          # Unduh asset ZIP (retry 3x)
+          ok=0
+          for i in 1 2 3; do
+            if curl -sfL -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              "$ZIP_URL" -o project.zip && [ -s project.zip ]; then
+              ok=1
+              break
+            fi
+            echo "Percobaan $i/3: unduh asset gagal, tunggu 5 detik..."
+            rm -f project.zip
+            sleep 5
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::Gagal mengunduh asset ZIP dari release ${{ inputs.tag }}"
+            exit 1
+          fi
           echo "ZIP size: $(du -h project.zip | cut -f1)"
 
           # Ekstrak + ratakan jika ZIP punya satu folder root
@@ -88,6 +112,42 @@ jobs:
             flutter create . --platforms android --project-name "$PROJECT_NAME"
           fi
           flutter pub get
+
+      # Flutter stable terbaru butuh Gradle minimal 8.14 — project lama
+      # (mis. Gradle 8.12) otomatis di-upgrade wrapper-nya sebelum build.
+      - name: Patch Gradle wrapper (min 8.14)
+        working-directory: ./project
+        run: |
+          set -e
+          TARGET="8.14.3"
+          # Jika bisa, pakai Gradle 8.x terbaru dari services.gradle.org
+          LATEST8=$(curl -sL --max-time 15 https://services.gradle.org/versions/all \
+            | jq -r '[.[] | select((.snapshot // false) == false and (.nightly // false) == false and ((.rcFor // "") == "") and ((.broken // false) == false) and (.version | startswith("8.")))][0].version // empty' 2>/dev/null || true)
+          if [ -n "$LATEST8" ]; then
+            LOW=$(printf '%s\n%s\n' "$LATEST8" "$TARGET" | sort -V | head -n1)
+            if [ "$LOW" = "$TARGET" ]; then TARGET="$LATEST8"; fi
+          fi
+          echo "Target Gradle: $TARGET"
+          PROPS=$(find . -path "*/gradle/wrapper/gradle-wrapper.properties" -not -path "*/build/*" 2>/dev/null || true)
+          if [ -z "$PROPS" ]; then
+            echo "Tidak ada gradle-wrapper.properties → lewati patch"
+            exit 0
+          fi
+          while IFS= read -r PROP; do
+            CUR=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*' "$PROP" | head -n1 | sed 's/^gradle-//' || true)
+            if [ -z "$CUR" ]; then
+              echo "$PROP: distributionUrl tidak terbaca → set langsung ke $TARGET"
+              sed -i "s#^distributionUrl=.*#distributionUrl=https://services.gradle.org/distributions/gradle-${TARGET}-bin.zip#" "$PROP"
+              continue
+            fi
+            LOW=$(printf '%s\n%s\n' "$CUR" "$TARGET" | sort -V | head -n1)
+            if [ "$LOW" != "$TARGET" ]; then
+              sed -i -E "s#gradle-[0-9]+(\.[0-9]+)*-(all|bin)\.zip#gradle-${TARGET}-bin.zip#" "$PROP"
+              echo "$PROP: Gradle $CUR → $TARGET (Flutter terbaru butuh minimal 8.14.0)"
+            else
+              echo "$PROP: Gradle $CUR sudah memenuhi syarat (target >= $TARGET)"
+            fi
+          done <<< "$PROPS"
 
       - name: Build APK
         working-directory: ./project
