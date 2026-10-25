@@ -1,0 +1,259 @@
+name: Web to APK
+
+# Workflow: bungkus URL website menjadi APK WebView Android.
+# Membangun project Android minimal secara dinamis (debug + release signed).
+# Dipicu via workflow_dispatch oleh bot (server.js).
+
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: "URL website target"
+        required: true
+        type: string
+      app_name:
+        description: "Nama aplikasi"
+        required: true
+        type: string
+      icon_url:
+        description: "URL icon launcher (PNG/JPG)"
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17 (Zulu)
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - name: Siapkan project WebView Android
+        env:
+          WEB_URL: ${{ inputs.web_url }}
+          APP_NAME: ${{ inputs.app_name }}
+          ICON_URL: ${{ inputs.icon_url }}
+        run: |
+          set -e
+          mkdir -p webapk/app/src/main/java/com/web2apk/app
+          mkdir -p webapk/app/src/main/res/values
+          for D in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            mkdir -p "webapk/app/src/main/res/mipmap-$D"
+          done
+
+          # ── 1) Unduh & siapkan icon launcher (5 resolusi) ──
+          curl -sL "$ICON_URL" -o icon_raw
+          if [ ! -s icon_raw ]; then
+            echo "::error::Icon gagal diunduh dari $ICON_URL"
+            exit 1
+          fi
+          for D in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            F="${D%%:*}"; S="${D##*:}"
+            convert icon_raw -resize "${S}x${S}" "webapk/app/src/main/res/mipmap-${F}/ic_launcher.png" 2>/dev/null \
+              || cp icon_raw "webapk/app/src/main/res/mipmap-${F}/ic_launcher.png"
+          done
+
+          # ── 2) strings.xml (nama app, di-escape untuk XML) ──
+          APP_NAME_ESC=$(printf '%s' "$APP_NAME" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+          printf '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n  <string name="app_name">%s</string>\n</resources>\n' "$APP_NAME_ESC" \
+            > webapk/app/src/main/res/values/strings.xml
+
+          # ── 3) AndroidManifest.xml ──
+          cat > webapk/app/src/main/AndroidManifest.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:usesCleartextTraffic="true"
+                  android:hardwareAccelerated="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          XML
+
+          # ── 4) MainActivity.java (WebView sederhana + tombol back) ──
+          cat > webapk/app/src/main/java/com/web2apk/app/MainActivity.java <<'JAVA'
+          package com.web2apk.app;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.view.KeyEvent;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+
+              private WebView webView;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings s = webView.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setLoadWithOverviewMode(true);
+                  s.setUseWideViewPort(true);
+                  s.setSupportZoom(true);
+                  s.setBuiltInZoomControls(true);
+                  s.setDisplayZoomControls(false);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient());
+                  webView.loadUrl(BuildConfig.WEB_URL);
+              }
+
+              @Override
+              public boolean onKeyDown(int keyCode, KeyEvent event) {
+                  if (keyCode == KeyEvent.KEYCODE_BACK && webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                      return true;
+                  }
+                  return super.onKeyDown(keyCode, event);
+              }
+          }
+          JAVA
+
+          # ── 5) Gradle files ──
+          cat > webapk/settings.gradle <<'GRADLE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WebAPK"
+          include ':app'
+          GRADLE
+
+          cat > webapk/build.gradle <<'GRADLE'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          GRADLE
+
+          cat > webapk/gradle.properties <<'GRADLE'
+          org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          GRADLE
+
+          cat > webapk/app/build.gradle <<'GRADLE'
+          plugins {
+              id 'com.android.application'
+          }
+
+          // URL website di-inject lewat -PwebUrl="..." dari workflow
+          def webUrl = (project.findProperty('webUrl') ?: 'https://example.com').toString()
+          def safeUrl = webUrl.replace('\\', '\\\\').replace('"', '\\"')
+
+          android {
+              namespace 'com.web2apk.app'
+              compileSdk 34
+
+              signingConfigs {
+                  release {
+                      // Keystore di-generate otomatis saat setup project (langkah sebelumnya)
+                      storeFile file('release.keystore')
+                      storePassword 'web2apk123456'
+                      keyAlias 'webapk'
+                      keyPassword 'web2apk123456'
+                  }
+              }
+
+              defaultConfig {
+                  applicationId 'com.web2apk.app'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+                  buildConfigField 'String', 'WEB_URL', "\"${safeUrl}\""
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                  }
+              }
+
+              buildFeatures {
+                  buildConfig true
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          GRADLE
+
+          # ── 6) Keystore release (auto-generate, deterministik) ──
+          keytool -genkeypair -v \
+            -keystore webapk/app/release.keystore \
+            -storetype PKCS12 \
+            -alias webapk \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass web2apk123456 -keypass web2apk123456 \
+            -dname "CN=Web2APK, OU=Bot, O=Bot, L=Jakarta, ST=Jakarta, C=ID"
+
+          echo "=== Struktur webapk ==="
+          find webapk -type f | sort
+
+      - name: Build APK (debug + release)
+        working-directory: webapk
+        env:
+          WEB_URL: ${{ inputs.web_url }}
+        run: |
+          set -e
+          # Pakai wrapper dengan versi Gradle pasti (kompatibel AGP 8.5.2)
+          gradle wrapper --gradle-version 8.9 --no-daemon
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleDebug assembleRelease -PwebUrl="$WEB_URL"
+          echo "=== Hasil build ==="
+          find app/build/outputs/apk -name "*.apk" -exec ls -la {} \;
+
+      - name: Upload artifact APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: web2apk
+          path: |
+            webapk/app/build/outputs/apk/debug/*.apk
+            webapk/app/build/outputs/apk/release/*.apk
+          retention-days: 3
+          if-no-files-found: error
