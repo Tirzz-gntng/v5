@@ -33,11 +33,15 @@ jobs:
           distribution: zulu
           java-version: "17"
 
-      # Versi Flutter stable TERBARU (sesuai kebutuhan: selalu up-to-date)
-      - name: Setup Flutter (stable terbaru)
+      # VERSI PINNED — kombinasi yang TERBUKTI sukses build di repo ini.
+      # Jangan pakai "stable terbaru": tiap Flutter baru menaikkan syarat
+      # Gradle/AGP/Kotlin dan project lama selalu kena error baru.
+      # Pin = build deterministik & hasil konsisten.
+      - name: Setup Flutter (pinned 3.38.0)
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: 3.38.0
 
       - name: Download ZIP project dari Release
         env:
@@ -113,9 +117,11 @@ jobs:
           fi
           flutter pub get
 
-      # Flutter stable terbaru menaikkan syarat Gradle / AGP / Kotlin —
-      # project lama otomatis disesuaikan sebelum build (tanpa mengubah project user).
-      - name: Patch Gradle, AGP & Kotlin (sesuaikan Flutter terbaru)
+      # Project lama di bawah syarat minimum Flutter yang terpasang otomatis
+      # dinaikkan PERSIS sampai minimum itu — TIDAK ke versi terbaru.
+      # (Kotlin/AGP terbaru bisa menolak sintaks project lama, contoh nyata:
+      #  Kotlin 2.4 menolak "kotlinOptions jvmTarget" → BUILD GAGAL.)
+      - name: Patch Gradle, AGP & Kotlin (minimum sesuai Flutter)
         working-directory: ./project
         run: |
           set -e
@@ -134,22 +140,14 @@ jobs:
           MIN_AGP=$(flutter_min errorAGPVersion "8.11.1")
           MIN_KGP=$(flutter_min errorKGPVersion "2.1.0")
 
-          # ── (2) Versi TERBARU per jalur mayor (stabil, tanpa alpha/beta/rc) ──
-          maven_latest() {
-            curl -sL --max-time 20 "$1" | grep -oE '<version>[0-9][0-9.]*</version>' \
-              | sed 's/<[^>]*>//g' | grep -E "^$2" | sort -V | tail -n1
-          }
-          AGP8=$(maven_latest "https://dl.google.com/android/maven2/com/android/application/com.android.application.gradle.plugin/maven-metadata.xml" "8\.")
-          KOT2=$(maven_latest "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-gradle-plugin/maven-metadata.xml" "2\.")
-          LATEST8=$(curl -sL --max-time 15 https://services.gradle.org/versions/all \
-            | jq -r '[.[] | select((.snapshot // false) == false and (.nightly // false) == false and ((.rcFor // "") == "") and ((.broken // false) == false) and (.version | startswith("8.")))][0].version // empty' 2>/dev/null || true)
-
-          maxv() { printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1; }
-          TARGET_GRADLE=$(maxv "${LATEST8:-8.14.3}" "$MIN_GRADLE")
-          TARGET_AGP=$(maxv "${AGP8:-8.11.1}" "$MIN_AGP")
-          TARGET_KOT=$(maxv "${KOT2:-2.1.0}" "$MIN_KGP")
-          echo "Target: Gradle $TARGET_GRADLE | AGP $TARGET_AGP | Kotlin $TARGET_KOT"
-          echo "(minimum Flutter: $MIN_GRADLE / $MIN_AGP / $MIN_KGP)"
+          # ── (2) Target = MINIMUM yang disyaratkan Flutter terpasang ──
+          # PENTING: JANGAN naikkan ke versi terbaru. Versi terbaru bisa
+          # menolak sintaks project lama (Kotlin 2.4 menolak kotlinOptions).
+          # Minimum Flutter dijamin kompatibel dgn Flutter yang dipakai build.
+          TARGET_GRADLE="$MIN_GRADLE"
+          TARGET_AGP="$MIN_AGP"
+          TARGET_KOT="$MIN_KGP"
+          echo "Target (minimum Flutter): Gradle $TARGET_GRADLE | AGP $TARGET_AGP | Kotlin $TARGET_KOT"
 
           # ── (3) Patch gradle-wrapper.properties (semua yang ditemukan) ──
           PROPS=$(find . -path "*/gradle/wrapper/gradle-wrapper.properties" -not -path "*/build/*" 2>/dev/null || true)
