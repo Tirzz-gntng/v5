@@ -113,41 +113,97 @@ jobs:
           fi
           flutter pub get
 
-      # Flutter stable terbaru butuh Gradle minimal 8.14 — project lama
-      # (mis. Gradle 8.12) otomatis di-upgrade wrapper-nya sebelum build.
-      - name: Patch Gradle wrapper (min 8.14)
+      # Flutter stable terbaru menaikkan syarat Gradle / AGP / Kotlin —
+      # project lama otomatis disesuaikan sebelum build (tanpa mengubah project user).
+      - name: Patch Gradle, AGP & Kotlin (sesuaikan Flutter terbaru)
         working-directory: ./project
         run: |
           set -e
-          TARGET="8.14.3"
-          # Jika bisa, pakai Gradle 8.x terbaru dari services.gradle.org
+
+          # ── (1) Versi MINIMUM yang diminta Flutter yang terpasang ──
+          FLUTTER_ROOT="$(dirname "$(dirname "$(command -v flutter)")")"
+          CHK="$FLUTTER_ROOT/packages/flutter_tools/gradle/src/main/kotlin/DependencyVersionChecker.kt"
+          flutter_min() {
+            if [ -f "$CHK" ]; then
+              V=$(grep -oE "$1[^=]*= *(AndroidPlugin)?Version\([0-9]+, *[0-9]+, *[0-9]+\)" "$CHK" 2>/dev/null | head -n1 | grep -oE "\([0-9]+, *[0-9]+, *[0-9]+\)" | tr -d '()' | awk -F', *' '{print $1"."$2"."$3}')
+              if [ -n "$V" ]; then echo "$V"; return; fi
+            fi
+            echo "$2"
+          }
+          MIN_GRADLE=$(flutter_min errorGradleVersion "8.14.0")
+          MIN_AGP=$(flutter_min errorAGPVersion "8.11.1")
+          MIN_KGP=$(flutter_min errorKGPVersion "2.1.0")
+
+          # ── (2) Versi TERBARU per jalur mayor (stabil, tanpa alpha/beta/rc) ──
+          maven_latest() {
+            curl -sL --max-time 20 "$1" | grep -oE '<version>[0-9][0-9.]*</version>' \
+              | sed 's/<[^>]*>//g' | grep -E "^$2" | sort -V | tail -n1
+          }
+          AGP8=$(maven_latest "https://dl.google.com/android/maven2/com/android/application/com.android.application.gradle.plugin/maven-metadata.xml" "8\.")
+          KOT2=$(maven_latest "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-gradle-plugin/maven-metadata.xml" "2\.")
           LATEST8=$(curl -sL --max-time 15 https://services.gradle.org/versions/all \
             | jq -r '[.[] | select((.snapshot // false) == false and (.nightly // false) == false and ((.rcFor // "") == "") and ((.broken // false) == false) and (.version | startswith("8.")))][0].version // empty' 2>/dev/null || true)
-          if [ -n "$LATEST8" ]; then
-            LOW=$(printf '%s\n%s\n' "$LATEST8" "$TARGET" | sort -V | head -n1)
-            if [ "$LOW" = "$TARGET" ]; then TARGET="$LATEST8"; fi
-          fi
-          echo "Target Gradle: $TARGET"
+
+          maxv() { printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1; }
+          TARGET_GRADLE=$(maxv "${LATEST8:-8.14.3}" "$MIN_GRADLE")
+          TARGET_AGP=$(maxv "${AGP8:-8.11.1}" "$MIN_AGP")
+          TARGET_KOT=$(maxv "${KOT2:-2.1.0}" "$MIN_KGP")
+          echo "Target: Gradle $TARGET_GRADLE | AGP $TARGET_AGP | Kotlin $TARGET_KOT"
+          echo "(minimum Flutter: $MIN_GRADLE / $MIN_AGP / $MIN_KGP)"
+
+          # ── (3) Patch gradle-wrapper.properties (semua yang ditemukan) ──
           PROPS=$(find . -path "*/gradle/wrapper/gradle-wrapper.properties" -not -path "*/build/*" 2>/dev/null || true)
           if [ -z "$PROPS" ]; then
-            echo "Tidak ada gradle-wrapper.properties → lewati patch"
-            exit 0
+            echo "Tidak ada gradle-wrapper.properties → lewati patch wrapper"
+          else
+            while IFS= read -r PROP; do
+              CUR=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*' "$PROP" | head -n1 | sed 's/^gradle-//' || true)
+              if [ -z "$CUR" ]; then
+                echo "$PROP: distributionUrl tidak terbaca → set langsung ke $TARGET_GRADLE"
+                sed -i "s#^distributionUrl=.*#distributionUrl=https://services.gradle.org/distributions/gradle-${TARGET_GRADLE}-bin.zip#" "$PROP"
+                continue
+              fi
+              LOW=$(printf '%s\n%s\n' "$CUR" "$TARGET_GRADLE" | sort -V | head -n1)
+              if [ "$LOW" != "$TARGET_GRADLE" ]; then
+                sed -i -E "s#gradle-[0-9]+(\.[0-9]+)*-(all|bin)\.zip#gradle-${TARGET_GRADLE}-bin.zip#" "$PROP"
+                echo "$PROP: Gradle $CUR → $TARGET_GRADLE"
+              else
+                echo "$PROP: Gradle $CUR sudah memenuhi syarat (target >= $TARGET_GRADLE)"
+              fi
+            done <<< "$PROPS"
           fi
-          while IFS= read -r PROP; do
-            CUR=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*' "$PROP" | head -n1 | sed 's/^gradle-//' || true)
-            if [ -z "$CUR" ]; then
-              echo "$PROP: distributionUrl tidak terbaca → set langsung ke $TARGET"
-              sed -i "s#^distributionUrl=.*#distributionUrl=https://services.gradle.org/distributions/gradle-${TARGET}-bin.zip#" "$PROP"
-              continue
+
+          # ── (4) Patch AGP & Kotlin (settings/build gradle, groovy & kts) ──
+          patch_file() {
+            F="$1"
+            CUR_AGP=$(grep -hoE "(com\.android\.(application|library)[\"']?\)?[[:space:]]*,?[[:space:]]*version[[:space:]]*[\"'][0-9][0-9.]*|com\.android\.tools\.build:gradle:[0-9][0-9.]*)" "$F" 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | sort -u | tail -n1)
+            if [ -n "$CUR_AGP" ]; then
+              LOW=$(printf '%s\n%s\n' "$CUR_AGP" "$TARGET_AGP" | sort -V | head -n1)
+              if [ "$LOW" != "$TARGET_AGP" ]; then
+                perl -pi -e "s/(com\\.android\\.application[\"']?\\)?\\s*,?\\s*version\\s*[\"'])[0-9][0-9.]*/\${1}$TARGET_AGP/g; s/(com\\.android\\.library[\"']?\\)?\\s*,?\\s*version\\s*[\"'])[0-9][0-9.]*/\${1}$TARGET_AGP/g; s/(com\\.android\\.tools\\.build:gradle:)[0-9][0-9.]*/\${1}$TARGET_AGP/g" "$F"
+                echo "$F: AGP $CUR_AGP → $TARGET_AGP"
+              else
+                echo "$F: AGP $CUR_AGP sudah cukup (target $TARGET_AGP)"
+              fi
             fi
-            LOW=$(printf '%s\n%s\n' "$CUR" "$TARGET" | sort -V | head -n1)
-            if [ "$LOW" != "$TARGET" ]; then
-              sed -i -E "s#gradle-[0-9]+(\.[0-9]+)*-(all|bin)\.zip#gradle-${TARGET}-bin.zip#" "$PROP"
-              echo "$PROP: Gradle $CUR → $TARGET (Flutter terbaru butuh minimal 8.14.0)"
-            else
-              echo "$PROP: Gradle $CUR sudah memenuhi syarat (target >= $TARGET)"
+            CUR_KOT=$(grep -hoE "org\.jetbrains\.kotlin(\.[A-Za-z0-9_]+)?[\"']?\)?[[:space:]]*,?[[:space:]]*version[[:space:]]*[\"'][0-9][0-9.]*|org\.jetbrains\.kotlin:kotlin-gradle-plugin:[0-9][0-9.]*" "$F" 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | sort -u | tail -n1)
+            if [ -n "$CUR_KOT" ]; then
+              LOW=$(printf '%s\n%s\n' "$CUR_KOT" "$TARGET_KOT" | sort -V | head -n1)
+              if [ "$LOW" != "$TARGET_KOT" ]; then
+                perl -pi -e "s/(org\\.jetbrains\\.kotlin(?:\\.[A-Za-z0-9_]+)?[\"']?\\)?\\s*,?\\s*version\\s*[\"'])[0-9][0-9.]*/\${1}$TARGET_KOT/g; s/(org\\.jetbrains\\.kotlin:kotlin-gradle-plugin:)[0-9][0-9.]*/\${1}$TARGET_KOT/g" "$F"
+                echo "$F: Kotlin $CUR_KOT → $TARGET_KOT"
+              else
+                echo "$F: Kotlin $CUR_KOT sudah cukup (target $TARGET_KOT)"
+              fi
             fi
-          done <<< "$PROPS"
+          }
+          AGPFILES=$(find . \( -name "*.gradle" -o -name "*.gradle.kts" \) -not -path "*/build/*" -not -path "*/.dart_tool/*" 2>/dev/null || true)
+          if [ -n "$AGPFILES" ]; then
+            while IFS= read -r F; do patch_file "$F"; done <<< "$AGPFILES"
+          else
+            echo "Tidak ada file gradle (project tanpa folder android) → lewati patch AGP/Kotlin"
+          fi
+          exit 0
 
       - name: Build APK
         working-directory: ./project
